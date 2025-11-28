@@ -8,7 +8,7 @@ import numpy as np
 HR_DIR="hr_images"      #yuksek cozunurluklu dosyalarimiz
 LR_DIR="lr_images"      #olusturacagimiz düsük cozunurluklu dosyamiz
 SCALE_FACTOR=4          #4 kat kucultme buyutme hedefimiz
-ALLOWED_EXTENSIONS=['*. jpg','*.png','*.jpeg']
+ALLOWED_EXTENSIONS=['*.jpg','*.png','*.jpeg']
 
 def prepare_dataset():
     #1- LR Klasorunu yoksa olustur: Ciktilari duzenli tutamak icin [2] 
@@ -33,7 +33,7 @@ def prepare_dataset():
     #3. Her HR goruntuyu ısleyıp LR karsılıgını olustur
     for i, hr_path in enumerate(hr_files):
         base_name=os.path.basename(hr_path)   #dosya adini aliyor sadece (foto1.png)
-        name, ext=os.path.sliptext(base_name) #dosya adini ve uzanti olarak 2 ye boler
+        name, ext=os.path.splitext(base_name) #dosya adini ve uzanti olarak 2 ye boler
 
         hr_image=cv2.imread(hr_path)
 
@@ -64,7 +64,7 @@ def prepare_dataset():
         print(f"  [{i+1}/{len(hr_files)}] {base_name} ({w}x{h}) -> {lr_w}x{lr_h} olarak kaydedildi.")
         #her bir resim islendiginde terminale bilgi yazdirir.
         
-    print(f"\nVeri seti hazırlığı tamamlandı. LR görüntüler '{LR_DIR}' klasöründe.")
+    print(f"\nVeri seti hazirligi tamamlandi. LR görüntüler '{LR_DIR}' klasöründe.")
 
 
 if __name__ == "__main__": #main olarak calis,import edilince calismaz!
