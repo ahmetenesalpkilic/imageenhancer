@@ -1,85 +1,97 @@
-# train.py dosyası
-
-from sr_dataset import SRDataset # Kendi veri setimiz
-from srcnn_model import SRCNN     # Kendi modelimiz
+from sr_dataset import SRCNNDataset
+from srcnn_model import SRCNN
 from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import os
+import time
 
-#Egitim parametreleri
-HR_DIR="hr_images"
-LR_DIR="lr_images"
-BATCH_SIZE=16       #Bir adimda islenecek yama sayisi
-NUM_EPOCHS=10       #Veri setinin bir kez baştan sona işlenceği
-LEARNING_RATE=0.001 
-# GPU/CPU kontrolU: Hiz icin GPU (CUDA) varsa onu kullan
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# --- Parametreler ---
+HR_DIR = "hr_images"
+LR_DIR = "lr_images"
+BATCH_SIZE = 16
+NUM_EPOCHS = 10
+LEARNING_RATE = 0.001
+
+# Cihaz Seçimi
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+    print(f"✅ GPU BULUNDU: {torch.cuda.get_device_name(0)}")
+else:
+    DEVICE = torch.device("cpu")
+    print("⚠️ GPU BULUNAMADI, CPU kullanılıyor...")
 
 def train_model():
-    #1. Veri yukleyiciyi hazirla
-    train_dataset = SRDataset(hr_dir=HR_DIR,lr_dir=LR_DIR)
+    print("\n--- 1. Hazırlık Aşaması ---")
+    print("Dataset dosyaları taranıyor...")
+    
+    # Dataset Yükleme (Scale Factor 4)
+    try:
+        train_dataset = SRCNNDataset(
+            hr_dir=HR_DIR,
+            lr_dir=LR_DIR,
+            patch_size=33,
+            scale_factor=4
+        )
+        print(f"Dataset Başarılı! Toplam Resim: {len(train_dataset)}")
+    except Exception as e:
+        print(f"❌ Dataset Hatası: {e}")
+        return
 
-    #Dataloader: Veri yamalarini toplu halde hazirlar (Batching)
+    # DataLoader
+    print("DataLoader hazırlanıyor (num_workers=0)...")
     train_loader = DataLoader(
         dataset=train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,           #Her epochta veriyi karistir
-        num_workers=0
+        shuffle=True,
+        num_workers=4,    # Windows için kritik ayar (0 olmalı)
+        drop_last=True
     )
+    print("DataLoader Hazır.")
 
-    #2. Modeli ve Bilesenleri tanimla
-    model=SRCNN().to(DEVICE)
+    # Model
+    print(f"Model {DEVICE} cihazına aktarılıyor...")
+    model = SRCNN().to(DEVICE)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    print("Model Hazır.")
 
-    # Kayip Fonksiyonu: Mean Squared Error (MSE). PSNR'yi maksimize etmeyi hedefler [3, 4]
-    criterion=nn.MSELoss()
-
-    # Optimizasyon: Adam algoritmasi, agirliklari güncellemek icin kullanilir
-    optimizer=optim.Adam(model.parameters(),lr=LEARNING_RATE)
+    print("\n--- 2. Eğitim Başlıyor ---")
+    print("Lütfen bekleyin, ilk veri paketi (batch) hazırlanıyor...")
     
-    print(f"\nEgitim {DEVICE} uzerinde basliyor...")
+    start_time = time.time()
 
-    #3.Egitim dongusu
-    for epoch in range(1,NUM_EPOCHS +1):
-        model.train()   #Modeli egitim moduna al
-        running_loss=0.0
+    for epoch in range(1, NUM_EPOCHS + 1):
+        model.train()
+        running_loss = 0.0
+        
+        # İlk batch'in ne zaman geldiğini görmek için sayaç
+        for i, (lr_patches, hr_patches) in enumerate(train_loader):
+            if i == 0:
+                print(f"⚡ İlk Batch Geldi! (Süre: {time.time() - start_time:.1f} sn)")
+                print("GPU işlemeye başladı...")
 
-        #DataLoader'dan LR ve HR yamalari (batchler) alinir
-        for i,(lr_patches, hr_patches) in enumerate(train_loader):
+            lr_patches = lr_patches.to(DEVICE)
+            hr_patches = hr_patches.to(DEVICE)
 
-            #Veriyi cihaza (GPU/CPU) aktar
-            lr_patches=lr_patches.to(DEVICE)
-            hr_patches=hr_patches.to(DEVICE)
-
-            #Optimizasyon sifirlamasi
             optimizer.zero_grad()
-
-            #ileri besleme (Forward pass) LR yamasini modele ver, SR ciktisini al
-            sr_output=model(lr_patches)
-            
-            # Kayip Hesaplama (Loss Calculation): SR ciktisi ile Gercek HR hedefi karsilastirilir
+            sr_output = model(lr_patches)
             loss = criterion(sr_output, hr_patches)
-
-            # Geriye yayilim (Backward Pass): Hatanin ag boyunca yayilmasi
             loss.backward()
-
-            #Agirlik guncelleme
             optimizer.step()
 
             running_loss += loss.item()
 
-        # Her epoch sonunda ortalama kaybi yazdir
+            # Kullanıcıya çalıştığını hissettirmek için her 5 batch'te bir nokta koy
+            if i % 10 == 0:
+                print(".", end="", flush=True)
+
         avg_loss = running_loss / len(train_loader)
-        print(f"Epoch [{epoch}/{NUM_EPOCHS}] - Ortalama Kayip (Loss): {avg_loss:.6f}")   
+        print(f"\n✅ Epoch [{epoch}/{NUM_EPOCHS}] Tamamlandı - Loss: {avg_loss:.6f}")
 
-    print("\n Egitim Tamamlandi!")
-
-    #Egitilmis model agirliklarini kaydet (Daha sonra test etmek icin)
-
+    print("\n🎉 Eğitim Bitti!")
     torch.save(model.state_dict(), "srcnn_model_weights.pth")
-    print("Model ağırlıkları 'srcnn_model_weights.pth' olarak kaydedildi.")
+    print("Model kaydedildi.")
 
 if __name__ == "__main__":
-    train_model()                  
-
+    train_model()
