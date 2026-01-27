@@ -2,35 +2,47 @@ import torch
 import cv2
 import numpy as np
 import os
+
 from srcnn_model import SRCNN
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import structural_similarity as ssim
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-# --- Ayarlar ---
+# ------------------ AYARLAR ------------------
 WEIGHTS_PATH = "srcnn_model_weights.pth"
 SCALE_FACTOR = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ------------------ YCbCr (Y-channel) ------------------
 def rgb2ycbcr(img):
     """
-    Görüntüyü RGB'den YCbCr formatına çevirir ve sadece Y (Luminance) kanalını döndürür.
-    Formül: Y = 65.481 * R + 128.553 * G + 24.966 * B + 16
-    (Matlab standartlarına uygun dönüşüm - SRCNN makalelerinde bu kullanılır)
+    img: RGB image, float32, [0,1]
+    dönüş: Y channel, [0,1]
     """
-    y = 16. + (65.481 * img[:, :, 0] + 128.553 * img[:, :, 1] + 24.966 * img[:, :, 2])
-    return y / 255.0
+    return (
+        16.0 / 255.0
+        + (65.481 * img[:, :, 0]
+        + 128.553 * img[:, :, 1]
+        + 24.966 * img[:, :, 2]) / 255.0
+    )
 
+# ------------------ EVALUATION ------------------
 def evaluate_model():
-    print(f"🔬 AKADEMİK TEST BAŞLIYOR ({DEVICE})...\n")
+    print(f"🔬 AKADEMİK TEST BAŞLIYOR ({DEVICE})\n")
 
-    # 1. Modeli Yükle
+    # ---- MODEL ----
     model = SRCNN().to(DEVICE)
-    if os.path.exists(WEIGHTS_PATH):
-        model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=DEVICE))
-    else:
+    if not os.path.exists(WEIGHTS_PATH):
         print("❌ HATA: Model ağırlıkları bulunamadı.")
         return
+
+    model.load_state_dict(torch.load(WEIGHTS_PATH, map_location=DEVICE))
     model.eval()
+
+    # ---- LPIPS ----
+    lpips_fn = LearnedPerceptualImagePatchSimilarity(
+        net_type="alex"
+    ).to(DEVICE)
 
     lr_dir = "lr_images"
     hr_dir = "hr_images"
@@ -44,25 +56,25 @@ def evaluate_model():
         print("❌ HATA: Klasör boş.")
         return
 
-    # İstatistikleri tutacak listeler
-    avg_psnr_rgb, avg_ssim_rgb = [], []
-    avg_psnr_y, avg_ssim_y = [], []
-    
-    avg_bicubic_psnr, avg_bicubic_ssim = [], []
+    # ---- METRİK LİSTELERİ ----
+    avg_psnr_y = []
+    avg_ssim_y = []
+    avg_bicubic_psnr = []
+    avg_lpips = []
 
     print(f"📂 Toplam {len(files)} resim test edilecek...")
-    print("-" * 60)
-    print(f"{'Dosya':<20} | {'SRCNN (Y) PSNR':<15} | {'Bicubic (Y) PSNR':<15}")
-    print("-" * 60)
+    print("-" * 70)
+    print(f"{'Dosya':<20} | {'SRCNN Y-PSNR':<14} | {'Bicubic Y-PSNR':<16} | {'LPIPS ↓':<8}")
+    print("-" * 70)
+
+    tested = 0
 
     for idx, filename in enumerate(files):
-        # Dosya Yolları
         lr_path = os.path.join(lr_dir, filename)
-        base_name, ext = os.path.splitext(filename)
-        hr_name = base_name.replace("_lr", "") + ext
+        base, ext = os.path.splitext(filename)
+        hr_name = base.replace("_lr", "") + ext
         hr_path = os.path.join(hr_dir, hr_name)
 
-        # Okuma
         lr_img = cv2.imread(lr_path)
         hr_img = cv2.imread(hr_path)
 
@@ -70,83 +82,115 @@ def evaluate_model():
             continue
 
         h, w, _ = hr_img.shape
-        
-        # Bicubic Upscale (Model Girdisi)
-        lr_upscaled = cv2.resize(lr_img, (w, h), interpolation=cv2.INTER_CUBIC)
 
-        # Tensor Hazırlığı
-        img_input = cv2.cvtColor(lr_upscaled, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        img_tensor = torch.from_numpy(img_input).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+        # ---- BICUBIC UPSCALE ----
+        lr_upscaled = cv2.resize(
+            lr_img, (w, h), interpolation=cv2.INTER_CUBIC
+        )
 
-        # Model Tahmini
+        # ---- MODEL INPUT ----
+        inp_rgb = cv2.cvtColor(lr_upscaled, cv2.COLOR_BGR2RGB)
+        inp_rgb = inp_rgb.astype(np.float32) / 255.0
+
+        img_tensor = (
+            torch.from_numpy(inp_rgb)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(DEVICE)
+        )
+
+        # ---- INFERENCE ----
         with torch.no_grad():
-            output = model(img_tensor).squeeze(0).cpu().permute(1, 2, 0).numpy()
+            sr = model(img_tensor)
 
-        # Kırpma / Boyut Düzeltme
-        output = np.clip(output * 255.0, 0, 255).astype(np.uint8)
-        # BGR dönüşümü (OpenCV formatı)
-        sr_img_bgr = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
-        
-        # Boyut eşitleme (Crop)
-        out_h, out_w, _ = sr_img_bgr.shape
-        sr_img_bgr = sr_img_bgr[:h, :w]
-        
-        # --- METRİK HESAPLAMA ---
-        
-        # 1. RGB Metrikleri (İnsan gözü için genel referans)
+        sr = (
+            sr.squeeze(0)
+            .permute(1, 2, 0)
+            .cpu()
+            .numpy()
+        )
+        sr = np.clip(sr * 255.0, 0, 255).astype(np.uint8)
+
+        sr_bgr = cv2.cvtColor(sr, cv2.COLOR_RGB2BGR)
+        sr_bgr = sr_bgr[:h, :w]
+
+        # ---- RGB ----
         hr_rgb = cv2.cvtColor(hr_img, cv2.COLOR_BGR2RGB)
-        sr_rgb = cv2.cvtColor(sr_img_bgr, cv2.COLOR_BGR2RGB)
+        sr_rgb = cv2.cvtColor(sr_bgr, cv2.COLOR_BGR2RGB)
         bic_rgb = cv2.cvtColor(lr_upscaled, cv2.COLOR_BGR2RGB)
-        
-        avg_psnr_rgb.append(psnr(hr_rgb, sr_rgb, data_range=255))
-        avg_ssim_rgb.append(ssim(hr_rgb, sr_rgb, channel_axis=2, data_range=255))
 
-        # 2. Y-Channel Metrikleri (Akademik Standart)
-        # Görüntüleri 0-1 aralığına çekip Y kanalını alıyoruz
+        # ---- Y CHANNEL ----
         hr_y = rgb2ycbcr(hr_rgb.astype(np.float32) / 255.0)
         sr_y = rgb2ycbcr(sr_rgb.astype(np.float32) / 255.0)
         bic_y = rgb2ycbcr(bic_rgb.astype(np.float32) / 255.0)
-        
-        # Y-PSNR Hesapla (data_range=1.0 çünkü float 0-1 arası)
+
+        # ---- BORDER CROP (SRCNN PAPER) ----
+        shave = SCALE_FACTOR * 6
+        hr_y = hr_y[shave:-shave, shave:-shave]
+        sr_y = sr_y[shave:-shave, shave:-shave]
+        bic_y = bic_y[shave:-shave, shave:-shave]
+
+        # ---- PSNR / SSIM ----
         p_y = psnr(hr_y, sr_y, data_range=1.0)
         s_y = ssim(hr_y, sr_y, data_range=1.0)
-        
-        p_bic_y = psnr(hr_y, bic_y, data_range=1.0)
-        s_bic_y = ssim(hr_y, bic_y, data_range=1.0)
+
+        p_bic = psnr(hr_y, bic_y, data_range=1.0)
 
         avg_psnr_y.append(p_y)
         avg_ssim_y.append(s_y)
-        avg_bicubic_psnr.append(p_bic_y)
+        avg_bicubic_psnr.append(p_bic)
 
-        # Her 5 resimde bir veya sonuncuda yazdır
-        print(f"{filename:<20} | {p_y:.2f} dB        | {p_bic_y:.2f} dB")
+        # ---- LPIPS (RGB, [-1,1]) ----
+        sr_lp = torch.from_numpy(sr_rgb / 255.0).permute(2, 0, 1).unsqueeze(0)
+        hr_lp = torch.from_numpy(hr_rgb / 255.0).permute(2, 0, 1).unsqueeze(0)
 
-        # Örnek görsel kaydet (Sadece ilk resmi)
+        sr_lp = sr_lp * 2 - 1
+        hr_lp = hr_lp * 2 - 1
+
+        sr_lp = sr_lp.to(DEVICE)
+        hr_lp = hr_lp.to(DEVICE)
+
+        with torch.no_grad():
+            lp = lpips_fn(sr_lp, hr_lp)
+
+        avg_lpips.append(lp.item())
+
+        tested += 1
+
+        print(
+            f"{filename:<20} | {p_y:>6.2f} dB      | {p_bic:>6.2f} dB        | {lp.item():.4f}"
+        )
+
         if idx == 0:
-            cv2.imwrite("final_sr_output.png", sr_img_bgr)
+            cv2.imwrite("final_sr_output.png", sr_bgr)
             cv2.imwrite("final_bicubic.png", lr_upscaled)
 
-    print("-" * 60)
-    print("\n" + "="*40)
-    print("       📊 FİNAL SONUÇ RAPORU       ")
-    print("="*40)
-    
+    # ---- RAPOR ----
+    print("-" * 70)
+    print("\n" + "=" * 42)
+    print("        📊 FİNAL SONUÇ RAPORU        ")
+    print("=" * 42)
+
+    print(f"Toplam Test Edilen Resim: {tested}")
+    print("-" * 42)
+
     mean_psnr = np.mean(avg_psnr_y)
     mean_ssim = np.mean(avg_ssim_y)
-    mean_bicubic = np.mean(avg_bicubic_psnr)
-    
-    print(f"Toplam Test Edilen Resim: {len(files)}")
-    print("-" * 40)
-    print(f"Ortalama Y-PSNR (SRCNN)  : {mean_psnr:.4f} dB")
-    print(f"Ortalama Y-PSNR (Bicubic): {mean_bicubic:.4f} dB")
-    print(f"Ortalama Y-SSIM (SRCNN)  : {mean_ssim:.4f}")
-    print("-" * 40)
-    
-    gain = mean_psnr - mean_bicubic
-    if gain > 0:
-        print(f"🚀 BAŞARILI! Model ortalamada {gain:.4f} dB iyileştirme sağladı.")
-    else:
-        print(f"⚠️ HENÜZ DEĞİL. Ortalama performans klasik yöntemin gerisinde.")
+    mean_bic = np.mean(avg_bicubic_psnr)
+    mean_lpips = np.mean(avg_lpips)
 
+    print(f"Ortalama Y-PSNR (SRCNN)   : {mean_psnr:.4f} dB")
+    print(f"Ortalama Y-PSNR (Bicubic): {mean_bic:.4f} dB")
+    print(f"Ortalama Y-SSIM (SRCNN)   : {mean_ssim:.4f}")
+    print(f"Ortalama LPIPS (↓ daha iyi): {mean_lpips:.4f}")
+    print("-" * 42)
+
+    gain = mean_psnr - mean_bic
+    if gain > 0:
+        print(f"🚀 BAŞARILI! Ortalama {gain:.4f} dB PSNR iyileştirme.")
+    else:
+        print("⚠️ PSNR açısından bicubic gerisinde.")
+
+# ------------------ RUN ------------------
 if __name__ == "__main__":
     evaluate_model()
